@@ -11,6 +11,13 @@ INCLUDE_IPV6="${INCLUDE_IPV6:-0}"
 APPLY_NGINX="${APPLY_NGINX:-0}"
 
 BACKUP_FILE=""
+FILE_UPDATED=0
+
+TMP_IPV4_RAW=""
+TMP_IPV6_RAW=""
+TMP_IPV4_CIDRS=""
+TMP_IPV6_CIDRS=""
+TMP_OUTPUT=""
 
 C_RESET=""
 C_INFO=""
@@ -68,6 +75,11 @@ on_error() {
     local exit_code=$?
     local line_no=${1:-unknown}
     log ERROR "Failure detected (line=${line_no}, exit=${exit_code})"
+    if [[ "${FILE_UPDATED}" -eq 1 && -n "${BACKUP_FILE}" && -f "${BACKUP_FILE}" ]]; then
+        log_warn "Rolling back ${CF_FILE_PATH} from backup: ${BACKUP_FILE}"
+        cp -a "${BACKUP_FILE}" "${CF_FILE_PATH}" || true
+        FILE_UPDATED=0
+    fi
     exit "${exit_code}"
 }
 
@@ -96,6 +108,13 @@ is_valid_ipv4_cidr() {
 
     [[ "$mask" =~ ^[0-9]+$ ]] || return 1
     ((mask >= 0 && mask <= 32)) || return 1
+}
+
+is_valid_ipv6_cidr() {
+    local cidr="$1"
+    # Must contain at least one colon and a valid /prefix-length (0-128).
+    [[ "$cidr" == *:* ]] || return 1
+    [[ "$cidr" =~ ^[0-9a-fA-F:]+/([0-9]|[1-9][0-9]|1[0-1][0-9]|12[0-8])$ ]] || return 1
 }
 
 fetch_ipv4() {
@@ -131,7 +150,11 @@ fetch_ipv6() {
         line="${line%%#*}"
         line="${line//[$'\t\r\n ']/}"
         [[ -n "${line}" ]] || continue
-        printf '%s\n' "${line}" >> "${TMP_IPV6_CIDRS}"
+        if is_valid_ipv6_cidr "${line}"; then
+            printf '%s\n' "${line}" >> "${TMP_IPV6_CIDRS}"
+        else
+            die "Invalid IPv6 CIDR detected: ${line}"
+        fi
     done < "${TMP_IPV6_RAW}"
 
     [[ -s "${TMP_IPV6_CIDRS}" ]] || die "No IPv6 entries found from Cloudflare source."
@@ -165,6 +188,12 @@ write_cloudflare_file() {
 
     mkdir -p "$(dirname "${CF_FILE_PATH}")"
 
+    # Idempotency: skip write when content is identical to the current file.
+    if [[ -f "${CF_FILE_PATH}" ]] && diff -q "${TMP_OUTPUT}" "${CF_FILE_PATH}" >/dev/null 2>&1; then
+        log_info "Cloudflare IP list unchanged; skipping update"
+        return
+    fi
+
     if [[ -f "${CF_FILE_PATH}" ]]; then
         BACKUP_FILE="${BACKUP_DIR}/cloudflare.nginx.backup.$(date +%Y%m%d_%H%M%S).conf"
         cp -a "${CF_FILE_PATH}" "${BACKUP_FILE}"
@@ -172,6 +201,7 @@ write_cloudflare_file() {
     fi
 
     mv -f "${TMP_OUTPUT}" "${CF_FILE_PATH}"
+    FILE_UPDATED=1
     log_ok "Updated file atomically: ${CF_FILE_PATH}"
 }
 
@@ -181,9 +211,21 @@ test_and_reload_nginx() {
         return
     fi
 
+    if [[ "${FILE_UPDATED}" -eq 0 ]]; then
+        log_info "No config change; skipping nginx reload"
+        return
+    fi
+
     require_cmd nginx
     log_info "Testing nginx configuration"
-    nginx -t
+    if ! nginx -t; then
+        if [[ -n "${BACKUP_FILE}" && -f "${BACKUP_FILE}" ]]; then
+            log_warn "nginx -t failed; restoring backup: ${BACKUP_FILE}"
+            cp -a "${BACKUP_FILE}" "${CF_FILE_PATH}"
+            FILE_UPDATED=0
+        fi
+        die "nginx configuration test failed"
+    fi
 
     if command -v systemctl >/dev/null 2>&1; then
         log_info "Reloading nginx via systemctl"
@@ -198,6 +240,7 @@ test_and_reload_nginx() {
 
 main() {
     require_cmd curl
+    require_cmd diff
     require_cmd flock
     require_cmd sort
     require_cmd mktemp
@@ -222,6 +265,10 @@ main() {
 
     write_cloudflare_file
     test_and_reload_nginx
+
+    if [[ "${FILE_UPDATED}" -eq 0 ]]; then
+        log_ok "Already up-to-date: ${CF_FILE_PATH}"
+    fi
 }
 
 main "$@"
