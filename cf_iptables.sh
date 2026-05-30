@@ -142,10 +142,13 @@ del_rule_for_cidr() {
 }
 
 # Print sorted unique CIDRs currently managed in the chain (identified by comment).
+# grep is used instead of an awk regex to match the comment regardless of whether
+# iptables -S quotes the value (iptables omits quotes for comments with no spaces).
 get_chain_cidrs() {
 	iptables -S "${CHAIN_NAME}" 2>/dev/null \
-		| awk '/--comment "cloudflare-ipv4"/{for(i=1;i<=NF;i++) if($i=="-s"){print $(i+1); break}}' \
-		| sort -u
+		| grep -- 'cloudflare-ipv4' \
+		| awk '{for(i=1;i<=NF;i++) if($i=="-s"){print $(i+1); break}}' \
+		| LC_ALL=C sort -u
 }
 
 # Returns 0 if the port configuration stored in the chain differs from $PORTS, 1 if unchanged.
@@ -218,7 +221,7 @@ main() {
 
 	[[ -s "${TMP_CIDRS}" ]] || die "No valid Cloudflare IPv4 CIDR entries found."
 
-	sort -u "${TMP_CIDRS}" > "${TMP_SORTED}"
+	LC_ALL=C sort -u "${TMP_CIDRS}" > "${TMP_SORTED}"
 
 	BACKUP_FILE="${BACKUP_DIR}/iptables.backup.$(date +%Y%m%d_%H%M%S).rules"
 	iptables-save > "${BACKUP_FILE}"
