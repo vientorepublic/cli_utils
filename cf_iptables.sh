@@ -78,7 +78,8 @@ on_error() {
 }
 
 cleanup() {
-	rm -f "${TMP_RAW:-}" "${TMP_CIDRS:-}" "${TMP_SORTED:-}"
+	rm -f "${TMP_RAW:-}" "${TMP_CIDRS:-}" "${TMP_SORTED:-}" \
+		"${TMP_EXISTING:-}" "${TMP_TO_ADD:-}" "${TMP_TO_DEL:-}"
 }
 
 trap 'on_error ${LINENO}' ERR
@@ -125,6 +126,51 @@ add_rule_for_cidr() {
 	done
 }
 
+del_rule_for_cidr() {
+	local cidr="$1"
+
+	if [[ "${PORTS}" == "all" ]]; then
+		iptables -D "${CHAIN_NAME}" -s "${cidr}" -m comment --comment "cloudflare-ipv4" -j ACCEPT 2>/dev/null || true
+		return
+	fi
+
+	local p
+	IFS=',' read -r -a port_arr <<< "${PORTS}"
+	for p in "${port_arr[@]}"; do
+		iptables -D "${CHAIN_NAME}" -p tcp -s "${cidr}" --dport "${p}" -m comment --comment "cloudflare-ipv4" -j ACCEPT 2>/dev/null || true
+	done
+}
+
+# Print sorted unique CIDRs currently managed in the chain (identified by comment).
+get_chain_cidrs() {
+	iptables -S "${CHAIN_NAME}" 2>/dev/null \
+		| awk '/--comment "cloudflare-ipv4"/{for(i=1;i<=NF;i++) if($i=="-s"){print $(i+1); break}}' \
+		| sort -u
+}
+
+# Returns 0 if the port configuration stored in the chain differs from $PORTS, 1 if unchanged.
+# An empty chain is treated as unchanged; rules will simply be added fresh.
+chain_ports_changed() {
+	local sample_rule
+	sample_rule="$(iptables -S "${CHAIN_NAME}" 2>/dev/null | grep 'cloudflare-ipv4' | head -1)"
+	[[ -z "$sample_rule" ]] && return 1
+
+	if [[ "${PORTS}" == "all" ]]; then
+		echo "$sample_rule" | grep -q -- '--dport' && return 0
+	else
+		echo "$sample_rule" | grep -q -- '--dport' || return 0
+		local existing_ports
+		existing_ports="$(iptables -S "${CHAIN_NAME}" 2>/dev/null \
+			| grep 'cloudflare-ipv4' \
+			| grep -oP '(?<=--dport )\d+' \
+			| sort -un \
+			| tr '\n' ',' \
+			| sed 's/,$//')"
+		[[ "$existing_ports" != "${PORTS}" ]] && return 0
+	fi
+	return 1
+}
+
 main() {
 	require_cmd curl
 	require_cmd iptables
@@ -132,6 +178,7 @@ main() {
 	require_cmd iptables-restore
 	require_cmd flock
 	require_cmd sort
+	require_cmd comm
 	init_colors
 
 	if [[ "$(id -u)" -ne 0 ]]; then
@@ -143,9 +190,17 @@ main() {
 		die "Another instance is already running: ${LOCK_FILE}"
 	fi
 
+	if [[ "${PORTS}" != "all" ]]; then
+		PORTS="$(tr ',[:space:]' '\n' <<< "${PORTS}" | grep -v '^$' | sort -un | tr '\n' ',' | sed 's/,$//')"
+		[[ -n "${PORTS}" ]] || die "PORTS is empty after normalization."
+	fi
+
 	TMP_RAW="$(mktemp)"
 	TMP_CIDRS="$(mktemp)"
 	TMP_SORTED="$(mktemp)"
+	TMP_EXISTING="$(mktemp)"
+	TMP_TO_ADD="$(mktemp)"
+	TMP_TO_DEL="$(mktemp)"
 
 	log_info "Downloading Cloudflare IPv4 ranges: ${CF_IPV4_URL}"
 	curl -fsSL --retry 3 --retry-delay 1 --connect-timeout 5 "${CF_IPV4_URL}" -o "${TMP_RAW}"
@@ -169,19 +224,53 @@ main() {
 	iptables-save > "${BACKUP_FILE}"
 	log_info "Saved current iptables rules: ${BACKUP_FILE}"
 
+	local needs_full_load=0
+
 	if ! iptables -L "${CHAIN_NAME}" -n >/dev/null 2>&1; then
 		iptables -N "${CHAIN_NAME}"
 		CHANGED=1
 		log_info "Created chain: ${CHAIN_NAME}"
+		needs_full_load=1
+	elif chain_ports_changed; then
+		log_info "Port configuration changed → flushing chain for full rebuild"
+		iptables -F "${CHAIN_NAME}"
+		CHANGED=1
+		needs_full_load=1
 	fi
 
-	iptables -F "${CHAIN_NAME}"
-	CHANGED=1
-	log_info "Flushed chain: ${CHAIN_NAME}"
+	if [[ "${needs_full_load}" -eq 1 ]]; then
+		local count=0
+		while IFS= read -r cidr; do
+			add_rule_for_cidr "${cidr}"
+			count=$((count + 1))
+		done < "${TMP_SORTED}"
+		log_ok "Full load: applied ${count} CIDRs"
+	else
+		get_chain_cidrs > "${TMP_EXISTING}"
+		comm -23 "${TMP_SORTED}" "${TMP_EXISTING}" > "${TMP_TO_ADD}"
+		comm -13 "${TMP_SORTED}" "${TMP_EXISTING}" > "${TMP_TO_DEL}"
 
-	while IFS= read -r cidr; do
-		add_rule_for_cidr "${cidr}"
-	done < "${TMP_SORTED}"
+		local added=0 removed=0
+		while IFS= read -r cidr; do
+			[[ -z "$cidr" ]] && continue
+			add_rule_for_cidr "${cidr}"
+			added=$((added + 1))
+			CHANGED=1
+		done < "${TMP_TO_ADD}"
+
+		while IFS= read -r cidr; do
+			[[ -z "$cidr" ]] && continue
+			del_rule_for_cidr "${cidr}"
+			removed=$((removed + 1))
+			CHANGED=1
+		done < "${TMP_TO_DEL}"
+
+		if [[ "${added}" -eq 0 && "${removed}" -eq 0 ]]; then
+			log_ok "Rules already up-to-date (no changes)"
+		else
+			log_ok "Diff update: +${added} added, -${removed} removed"
+		fi
+	fi
 
 	if ! iptables -C INPUT -j "${CHAIN_NAME}" >/dev/null 2>&1; then
 		iptables -I INPUT 1 -j "${CHAIN_NAME}"
@@ -190,12 +279,12 @@ main() {
 		log_info "INPUT jump rule already exists for: ${CHAIN_NAME}"
 	fi
 
-	local count
-	count="$(wc -l < "${TMP_SORTED}" | tr -d ' ')"
+	local total
+	total="$(wc -l < "${TMP_SORTED}" | tr -d ' ')"
 	if [[ "${PORTS}" == "all" ]]; then
-		log_ok "Apply complete: allowed ${count} CIDRs (all ports)"
+		log_ok "Apply complete: ${total} active CIDRs (all ports)"
 	else
-		log_ok "Apply complete: allowed ${count} CIDRs (TCP ports: ${PORTS})"
+		log_ok "Apply complete: ${total} active CIDRs (TCP ports: ${PORTS})"
 	fi
 }
 
